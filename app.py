@@ -6,9 +6,13 @@ app = Flask(__name__)
 
 # Database connection for accessing billing database
 def get_db_connection():
-    conn = sqlite3.connect('billing_database.db')
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        conn = sqlite3.connect('billing_database.db')
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return None
 
 # Room rates by season
 room_rates = {
@@ -30,31 +34,46 @@ def determine_season(checkin_date):
     else:
         return 'low'
 
-@app.route('/bills/update/<int:booking_id>', methods=['POST'])
-def update_billing(booking_id):
-    db = get_db_connection()
-    cursor = db.cursor()
-    cursor.execute('SELECT category, checkin, checkout FROM booking WHERE id = ?', (booking_id,))
-    booking = cursor.fetchone()
-
-    if not booking:
-        return jsonify({'error': 'Booking not found'}), 404
-
-    room_type, checkin, checkout = booking['category'], booking['checkin'], booking['checkout']
-    
+def parse_dates(checkin, checkout):
     try:
         checkin_date = datetime.strptime(checkin, '%Y-%m-%d %H:%M:%S')
         checkout_date = datetime.strptime(checkout, '%Y-%m-%d %H:%M:%S')
+        return checkin_date, checkout_date
     except ValueError:
+        return None, None
+
+@app.route('/bills/update/<int:booking_id>', methods=['POST'])
+def update_billing(booking_id):
+    data = request.get_json()
+    
+    if not data or 'room_type' not in data or 'checkin' not in data or 'checkout' not in data:
+        return jsonify({'error': 'Missing data'}), 400
+    
+    room_type = data['room_type']
+    checkin = data['checkin']
+    checkout = data['checkout']
+    
+    # Parse dates
+    checkin_date, checkout_date = parse_dates(checkin, checkout)
+    if checkin_date is None or checkout_date is None:
         return jsonify({'error': 'Invalid date format'}), 400
     
     # Calculate billing details
     days_stayed = (checkout_date - checkin_date).days
-    season = determine_season(checkin_date)
-    daily_rate = room_rates[room_type][season]
-    total_bill = days_stayed * daily_rate
+    if days_stayed <= 0:
+        return jsonify({'error': 'Check-out date must be after check-in date'}), 400
     
-    # Insert or update billing information
+    season = determine_season(checkin_date)
+    daily_rate = room_rates.get(room_type)
+    
+    if not daily_rate:
+        return jsonify({'error': 'Invalid room type'}), 400
+
+    total_bill = days_stayed * daily_rate[season]
+
+    # Insert or update billing record
+    conn = get_db_connection()
+    cursor = conn.cursor()
     cursor.execute(''' 
         INSERT INTO billing (booking_id, room_type, days_stayed, season, daily_rate, total_bill)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -64,10 +83,10 @@ def update_billing(booking_id):
             season=excluded.season,
             daily_rate=excluded.daily_rate,
             total_bill=excluded.total_bill
-    ''', (booking_id, room_type, days_stayed, season, daily_rate, total_bill))
-    
-    db.commit()
-    db.close()
+    ''', (booking_id, room_type, days_stayed, season, daily_rate[season], total_bill))
+
+    conn.commit()
+    conn.close()
     return jsonify({'message': 'Billing updated', 'booking_id': booking_id})
 
 # Access all bills in the database
@@ -81,16 +100,17 @@ def get_all_bills():
 
 # Access specific bill in the database by id
 @app.route('/bills/<int:id>', methods=['GET'])
-def get_bil_by_id(id):
+def get_bill_by_id(id):
     with get_db_connection() as db:
         cursor = db.cursor()
         cursor.execute('SELECT * FROM billing WHERE id = ?', (id,))
-        bill = cursor.fetchall()
+        bill = cursor.fetchone()
 
     if not bill:
         return jsonify({'error': 'Bill not found'}), 404
 
-    return jsonify([dict(row) for row in bill])
+    return jsonify(dict(bill))
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001, host='0.0.0.0')
+    app.run(debug=True, port=5002, host='0.0.0.0')
+
